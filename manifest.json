@@ -1,8 +1,8 @@
 {
   "guid": "c61a29dd-3045-42b8-b7cb-6b212dc13c50",
   "name": "Specialist Agents",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "Aditya Kumar",
-  "description": "Exploration specialist layer for COVAS:NEXT. Milestone 1: deterministic materials/engineering need-scorer with a voiced round-trip (no LLM yet).",
+  "description": "Exploration specialist layer for COVAS:NEXT. Layer 1 deterministic materials/engineering need-scorer + Layer 2 persistent Goal Memory, voiced round-trip (no LLM yet).",
   "entrypoint": "SpecialistAgents.py"
 }

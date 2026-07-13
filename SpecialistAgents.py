@@ -1,17 +1,23 @@
 """
-Specialist Agents — multi-agent scaffold plugin for COVAS:NEXT.
+Specialist Agents — exploration specialist plugin for COVAS:NEXT.
 
-Milestone 1 (this session): prove data flows game -> deterministic detector ->
-voice, with ZERO reasoning in between. No LLM, no agents, no orchestrator.
+Layers implemented so far:
+  - Layer 1 (deterministic, no LLM): material_need_detector.py — need-scorer.
+  - Layer 2 (state, no LLM):         goal_memory.py — persistent goal store +
+                                     per-goal notify latch.
 
 Pipeline wired here:
   1. sideeffect `_on_event` fires on material/engineer game events
      (the events that mutate the Materials projection — materials.py process()).
-  2. runs the Layer-1 deterministic need-scorer (material_need_detector.py).
+  2. for each goal in Goal Memory, runs the deterministic need-scorer.
   3. logs the result.
-  4. on a real deficit, dispatches a PluginEvent via helper.dispatch_event.
-  5. register_event wires should_reply_check + prompt_generator so that event
-     reaches the main assistant's should_reply gate and is eligible to voice.
+  4. on a real deficit (edge-triggered per goal), dispatches a PluginEvent.
+  5. register_event wires should_reply_check + prompt_generator so the event
+     reaches the assistant's should_reply gate and is eligible to voice.
+
+NOT yet implemented (deferred, in dependency order): natural-language goal parse
+(the one legitimate small-LLM entry point), additional detectors, and the
+Layer-3 Reactive/Planning agents + orchestrator.
 
 Import discipline (so the module stays importable without the app's runtime deps):
   - `lib.PluginBase` and `lib.Event` import only stdlib -> safe at module scope.
@@ -21,13 +27,15 @@ Import discipline (so the module stays importable without the app's runtime deps
 
 from __future__ import annotations
 
+import os
 import sys
 from typing import TYPE_CHECKING
 
 from lib.PluginBase import PluginBase, PluginManifest
 from lib.Event import PluginEvent, GameEvent
 
-from .material_need_detector import TEST_GOAL, score_material_need, MaterialNeed
+from .material_need_detector import score_material_need, MaterialNeed
+from .goal_memory import GoalMemory
 
 if TYPE_CHECKING:
     from lib.PluginHelper import PluginHelper
@@ -44,10 +52,12 @@ def _safe_log(level: str, message: str) -> None:
 
 
 class SpecialistAgentsPlugin(PluginBase):
-    """Milestone-1 deterministic detector + voiced round-trip."""
+    """Deterministic detector + Goal Memory + voiced round-trip (no LLM yet)."""
 
     # Namespaced event name (projections/events keyed by name globally — avoid collisions).
     EVENT_NAME = "SpecialistMaterialOpportunity"
+
+    GOAL_STORE_FILENAME = "goal_memory.json"
 
     # Game events that mutate the Materials / EngineerProgress projections.
     # Source: src/lib/projections/materials.py process() handles Materials,
@@ -66,13 +76,18 @@ class SpecialistAgentsPlugin(PluginBase):
     def __init__(self, plugin_manifest: PluginManifest):
         super().__init__(plugin_manifest)
         self.helper: "PluginHelper | None" = None
-        # Edge-trigger latch: dispatch once per unmet->met transition, not every event.
-        self._notified = False
+        self.goals: GoalMemory = GoalMemory()
+        # Path to the persisted goal store; None disables persistence (used in tests).
+        self._goal_path: "str | None" = None
 
     def on_chat_start(self, helper: "PluginHelper"):
         self.helper = helper
-        self._notified = False
-        # Wire the voice path: this registers a should_reply handler on the Assistant
+        # Load (or seed) the persistent goal store from the plugin data folder.
+        self._goal_path = os.path.join(
+            helper.get_plugin_data_path(self.plugin_manifest), self.GOAL_STORE_FILENAME
+        )
+        self.goals = GoalMemory.load_or_seed(self._goal_path)
+        # Wire the voice path: registers a should_reply handler on the Assistant
         # and a prompt handler on the PromptGenerator (PluginHelper.py:116-146).
         helper.register_event(
             self.EVENT_NAME,
@@ -81,13 +96,16 @@ class SpecialistAgentsPlugin(PluginBase):
         )
         # Wire the detector to the event stream (PluginHelper.py:91-101).
         helper.register_sideeffect(self._on_event)
-        _safe_log("info", "[SpecialistAgents] milestone-1 detector + voiced round-trip registered.")
+        _safe_log(
+            "info",
+            f"[SpecialistAgents] registered; {len(self.goals)} goal(s) loaded from Goal Memory.",
+        )
 
     def on_chat_stop(self, helper: "PluginHelper"):
         _safe_log("info", "[SpecialistAgents] stopped.")
 
     # ----------------------------------------------------------------------- #
-    # Layer-1 detector, driven by the event bus.                              #
+    # Layer-1 detector over Layer-2 goals, driven by the event bus.           #
     # ----------------------------------------------------------------------- #
     def _on_event(self, event, projected_states) -> None:
         # Ignore anything that isn't a relevant material/engineer game event.
@@ -97,19 +115,26 @@ class SpecialistAgentsPlugin(PluginBase):
         if event.content.get("event") not in self.TRIGGER_EVENTS:
             return
 
-        need = score_material_need(
-            TEST_GOAL,
-            projected_states.get("Materials"),
-            projected_states.get("EngineerProgress"),
-        )
-        _safe_log("info", f"[SpecialistAgents] need-scorer -> {need.to_payload()}")
+        materials_state = projected_states.get("Materials")
+        engineer_state = projected_states.get("EngineerProgress")
 
-        if need.should_notify and not self._notified:
-            self._notified = True
-            self._dispatch_need(need)
-        elif not need.should_notify:
-            # deficit cleared -> re-arm the latch for next time.
-            self._notified = False
+        latch_changed = False
+        for goal in self.goals.list_goals():
+            key = goal.material_internal_name
+            need = score_material_need(goal, materials_state, engineer_state)
+            _safe_log("info", f"[SpecialistAgents] need-scorer -> {need.to_payload()}")
+
+            if need.should_notify and not self.goals.is_notified(key):
+                self.goals.mark_notified(key)
+                latch_changed = True
+                self._dispatch_need(need)
+            elif not need.should_notify and self.goals.is_notified(key):
+                # deficit cleared -> re-arm the latch for next time.
+                self.goals.reset_notified(key)
+                latch_changed = True
+
+        if latch_changed and self._goal_path:
+            self.goals.save(self._goal_path)
 
     def _dispatch_need(self, need: MaterialNeed) -> None:
         event = PluginEvent(
